@@ -186,6 +186,40 @@ class WhitelistOpts:
                 rv[f] = val
         return rv
 
+class ApprovalGroup:
+    # A group of users that must approve a signature
+    # - users: list of authorized users
+    # - min_users: how many of those are needed to approve
+
+    def __init__(self, j, idx):
+        def check_user(u):
+            if not Users.valid_username(u):
+                raise ValueError("Unknown user: %s" % u)
+            return u
+
+        self.index = idx+1
+        self.users = pop_list(j, 'users', check_user)
+
+
+        self.min_users = pop_int(j, 'min_users', 1, len(self.users))
+
+        assert len(self.users) > 0, "empty group"
+        assert sorted(set(self.users)) == sorted(self.users), 'dup users'
+
+    def to_text(self):
+        return ('%d of ' % self.min_users) + ', '.join(self.users)
+
+    def to_json(self):
+        return dict(users=self.users, min_users=self.min_users)
+
+    def matches(self, users):
+        # some remote users need to approve
+        given = set(self.users).intersection(users)
+        assert given, 'group %d: need user(s) confirmation' % self.index
+        assert len(given) >= self.min_users, 'group %d: need more users to confirm (got %d of %d)'%(
+                                    self.index, len(given), self.min_users)
+
+
 class ApprovalRule:
     # A rule which describes transactions we are okay with approving. It documents:
     # - whitelist: list of destination addresses allowed (or None=any)
@@ -223,6 +257,10 @@ class ApprovalRule:
         self.min_pct_self_transfer = pop_float(j, 'min_pct_self_transfer', 0, 100.0)
         self.patterns = pop_list(j, 'patterns')
 
+        # complex txn approval groups
+        grps = pop_list(j, 'groups') or []
+        self.groups = [ApprovalGroup(i, idx) for idx, i in enumerate(grps)]
+
         assert sorted(set(self.users)) == sorted(self.users), 'dup users'
 
         # whitelist_opts must not be present if no whitelist
@@ -256,7 +294,7 @@ class ApprovalRule:
         # cleaned up data
         flds = [ 'per_period', 'max_amount', 'users', 'min_users',
                     'local_conf', 'whitelist', 'wallet',
-                    'min_pct_self_transfer', 'patterns' ]
+                    'min_pct_self_transfer', 'patterns', ]
         rv = OrderedDict()
         for f in flds:
             val = getattr(self, f, None)
@@ -264,6 +302,8 @@ class ApprovalRule:
                 rv[f] = val
         if self.whitelist_opts:
             rv['whitelist_opts'] = self.whitelist_opts.to_json()
+        if self.groups:
+            rv['groups'] = [g.to_json() for g in self.groups]
         return rv
 
     def to_text(self):
@@ -301,6 +341,10 @@ class ApprovalRule:
         else:
             rv += ' will be approved'
 
+        for g in self.groups:
+            rv += g.to_text()
+            rv += ' '
+
         if self.whitelist:
             if self.whitelist_opts and self.whitelist_opts.attest:
                 rv += ' if outputs attested by one of: ' + ', '.join(self.whitelist)
@@ -323,7 +367,7 @@ class ApprovalRule:
         return rv
 
     def matches_transaction(self, psbt, users, total_out, local_oked, chain):
-        # Does this rule apply to this PSBT file? 
+        # Does this rule apply to this PSBT file?
         if self.wallet:
             # rule limited to one wallet
             if psbt.active_multisig:
@@ -384,6 +428,9 @@ class ApprovalRule:
             assert len(given) >= self.min_users, 'need more users to confirm (got %d of %d)'%(
                                         len(given), self.min_users)
 
+        for g in self.groups:
+            g.matches(users)
+
         if self.per_period is not None:
             # check this txn would not exceed the velocity limit
             assert self.spent_so_far + total_out <= self.per_period, 'would exceed period spending'
@@ -435,7 +482,7 @@ class AuditLogger:
             # mkdir if needed
             try: uos.stat(d)
             except: uos.mkdir(d)
-                
+
             self.fname = d + '/' + b2a_hex(self.digest[-8:]).decode('ascii') + '.log'
             self.fd = open(self.fname, 'a+t')       # append mode
         except (CardMissingError, OSError, NotImplementedError):
@@ -541,7 +588,7 @@ class HSMPolicy:
         if not self.period: return 0
         end = self.current_period + (self.period*60)
         return (utime.ticks_ms() // 1000) - end
-        
+
     def save(self):
         # Create JSON document for next time.
         simple = ['must_log', 'never_log', 'msg_paths', 'share_xpubs', 'share_addrs',
@@ -602,7 +649,7 @@ class HSMPolicy:
 
         fd.write('\nOther policy:\n')
         if not self.never_log:
-            fd.write('- MicroSD card %s receive log entries.\n' 
+            fd.write('- MicroSD card %s receive log entries.\n'
                                     % ('MUST' if self.must_log else 'will'))
         else:
             fd.write("- No logging.\n")
@@ -611,17 +658,17 @@ class HSMPolicy:
             fd.write('- Storage Locker will be updated, and can be read %d times.\n'
                             % self.allow_sl)
         elif self.allow_sl:
-            fd.write('- Storage Locker can be read only %s.\n' 
+            fd.write('- Storage Locker can be read only %s.\n'
                         % ('once' if self.allow_sl == 1 else ('%d times' % self.allow_sl)))
 
         if self.warnings_ok:
             fd.write('- PSBT warnings will be ignored.\n')
 
         if self.share_xpubs:
-            fd.write('- XPUB values will be shared, if path matches: m OR %s.\n' 
+            fd.write('- XPUB values will be shared, if path matches: m OR %s.\n'
                                 % plist(self.share_xpubs))
         if self.share_addrs:
-            fd.write('- Address values values will be shared, if path matches: %s.\n' 
+            fd.write('- Address values values will be shared, if path matches: %s.\n'
                                 % plist(self.share_addrs))
         if self.priv_over_ux:
             fd.write('- Status responses optimized for privacy.\n')
@@ -730,7 +777,7 @@ class HSMPolicy:
 
     def save_storage_locker(self):
         # save the "long secret" ... probably only happens first time HSM policy
-        # is activated, because we don't store that original value except here 
+        # is activated, because we don't store that original value except here
         # and in SE.
         from pincodes import pa
 
@@ -787,10 +834,10 @@ class HSMPolicy:
 
             log.info('Message signing requested:')
             log.info('SHA256(msg) = ' + b2a_hex(sha).decode('ascii'))
-            log.info('\n%d bytes to be signed by %s => %s' 
+            log.info('\n%d bytes to be signed by %s => %s'
                             % (len(msg_text), subpath, address))
 
-            if not self.msg_paths: 
+            if not self.msg_paths:
                 self.refuse(log, "Message signing not permitted")
                 return 'x'
 
@@ -845,7 +892,7 @@ class HSMPolicy:
                 hsm_ux_obj.test_restart = True
 
     def consume_local_code(self, psbt_sha):
-        # Return T if they got the code right, also (regardless) pick 
+        # Return T if they got the code right, also (regardless) pick
         # the next code to be provided.
 
         expect = calc_local_pincode(psbt_sha, self.next_local_code)
@@ -962,7 +1009,7 @@ class HSMPolicy:
         log.info("\nREFUSED: " + msg)
         self.refusals += 1
         self.last_refusal = msg
-        
+
         # Crash if too many refusals happen.
         if self.refusals >= ABSOLUTE_MAX_REFUSALS:
             from utils import clean_shutdown, call_later_ms

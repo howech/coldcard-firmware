@@ -6,7 +6,7 @@
 #
 
 import ustruct, ngu
-from public_constants import USER_AUTH_TOTP, USER_AUTH_HOTP, USER_AUTH_HMAC, USER_AUTH_SHOW_QR
+from public_constants import USER_AUTH_TOTP, USER_AUTH_HOTP, USER_AUTH_HMAC, USER_AUTH_SHOW_QR, USER_AUTH_ECDSA
 from public_constants import MAX_USERNAME_LEN, PBKDF2_ITER_COUNT
 from menu import MenuSystem, MenuItem
 from ucollections import namedtuple
@@ -69,7 +69,7 @@ def calc_local_pincode(psbt_sha, hmac_secret):
 
     num = ustruct.unpack('>I', digest[-4:])[0] & 0x7fffffff
     return '%06d' % (num % 1000000)
-    
+
 
 # settings key
 KEY = 'usr'
@@ -78,7 +78,7 @@ KEY = 'usr'
 UserInfo = namedtuple('UserInfo', 'auth_mode secret last_counter')
 
 class Users:
-    '''Track users and thier TOTP secrets or hashed passwords'''    
+    '''Track users and thier TOTP secrets or hashed passwords'''
 
     @classmethod
     def get(cls):
@@ -105,28 +105,28 @@ class Users:
     @classmethod
     def list(cls):
         return list(sorted(cls.get().keys()))
-        
+
     @classmethod
     def create(cls, username, auth_mode, secret):
         # create new user:
         # - username must be unique
         # - if secret is empty, we pick it and return choice
-        # - show QR of secret (for TOTP/HOTP) if 
+        # - show QR of secret (for TOTP/HOTP) if
         qr_mode = bool(auth_mode & USER_AUTH_SHOW_QR)
         if qr_mode:
             auth_mode &= ~USER_AUTH_SHOW_QR
             assert not secret
 
-        assert auth_mode in {USER_AUTH_TOTP, USER_AUTH_HOTP, USER_AUTH_HMAC}
+        assert auth_mode in {USER_AUTH_TOTP, USER_AUTH_HOTP, USER_AUTH_HMAC, USER_AUTH_ECDSA}
 
-        # validate username; 
+        # validate username;
         assert 1 < len(username) <= MAX_USERNAME_LEN, 'badlen'
         assert username[0] != '_', 'reserved'
 
         # We don't care if it exists, because then it's an update?
         # - but can safely let them reset the counter/totp level??
         # - not sure, so force them to delete on-device first
-        # - this check does not allow brute-force search for names (because 
+        # - this check does not allow brute-force search for names (because
         existing = cls.lookup(username)
         assert not existing, "exists"
 
@@ -136,6 +136,8 @@ class Users:
             picked = ''
             if auth_mode == USER_AUTH_HMAC:
                 assert len(secret) == 32
+            elif auth_mode == USER_AUTH_ECDSA:
+                assert len(secret) == 33   # Use sec format
             else:
                 assert len(secret) in {10, 20}
 
@@ -164,7 +166,7 @@ class Users:
             picked = ''
 
         return picked
-        
+
     @classmethod
     def delete(cls, username):
         # remove a user. simple. no checking
@@ -211,6 +213,31 @@ class Users:
                 cls.update_counter(username, 1)
 
             return ''
+
+        elif auth_mode == USER_AUTH_ECDSA:
+            if not token or len(token) != 65:
+                return 'invalid'
+
+            # TODO - there is a bug in the signing client that is not computing the header right.
+            # the workaround here is to just try all possible headers - it would be better if we
+            # just got it right on the signing end.
+            sigs = [ ngu.secp256k1.signature(h + token[1:]) for h in [b'\x00', b'\x01', b'\x02', b'\x03'] ]
+            for sig in sigs:
+                try:
+                    pubkey = sig.verify_recover(psbt_hash).to_bytes()
+                    if pubkey == secret:
+                        if last_counter == 0:
+                            # using this as marker that they have successfully used the code once
+                            cls.update_counter(username, 1)
+
+                        return ''
+                except:
+                    pass
+
+            return 'mismatch '
+
+
+            #return ''
 
         if len(token) != 6:
             return 'expect otp'
@@ -311,6 +338,8 @@ async def make_user_sub_menu(menu, label, item):
         dets = "HOTP: count=%d" % info.last_counter
     elif info.auth_mode == USER_AUTH_HMAC:
         dets = "Password: " + ('unused' if not info.last_counter else 'active')
+    elif info.auth_mode == USER_AUTH_ECDSA:
+        dets = "Pubkey: " + ('unused' if not info.last_counter else 'active')
 
     rv = [
         MenuItem('"%s"' % user),        # does nothing, it's a title
